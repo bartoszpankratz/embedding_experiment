@@ -1,5 +1,6 @@
-#using Distributed
+using Distributed
 #addprocs(Sys.CPU_THREADS - 2) 
+addprocs(4)
 
 @everywhere begin 
     using Base.Iterators
@@ -71,7 +72,7 @@
     
 
     #General Parameters:
-    no_iters = 30
+    no_iters = 50
     seed = 1442
     Random.seed!(seed)
     
@@ -96,15 +97,15 @@
     #ns = [10^3, 10^4,10^6]
     ns = 10^3
     #ξs = range(0.0, 1.0, step = 0.05)
-    #ξs = [0.25, 0.5, 0.75]
-    ξs  = 0.5
+    ξs = [0.15, 0.25, 0.5, 0.65, 0.75, 0.85]
+    #ξs  = 0.5
     βs = [1.1, 1.5, 1.9]
     #βs = 1.5
     γs = [2.1, 2.5, 2.9]
     #γs = 2.5
     isCL = false        
-    #min_deg = [1,2,5]
-    min_deg = 5
+    min_deg = [1,2,5]
+    #min_deg = 5
     is_local = false
     
     graph_params = sort(reshape(collect(product(ns,ξs,βs,γs,isCL,min_deg,is_local)),:));
@@ -134,7 +135,7 @@
     grarep_k = [1,2,4,8]
 
     #HOPE parameters:
-    sim_meausures = [:katz,:ppr, :cn, :aa]
+    sim_meausures = [:katz, :ppr, :cn, :aa]
     
 end
 
@@ -147,9 +148,12 @@ end
     max_deg = Int(ceil(sqrt(n)))
     
     #import Python packages: Igraph and Leiden algorithm:
+    nx = pyimport("networkx");
+    community_louvain = pyimport("community"); 
     ig = pyimport("igraph");
     la = pyimport("leidenalg");
-    
+    ecg = pyimport("partition_igraph")
+
     #check if graph already exist:
     g_name = graphs_dir * "g_$(n)_$(ξ)_$(γ)_$(β)_$(min_deg).dat"
     g_cl_name = graphs_dir * "g_clusters_$(n)_$(ξ)_$(γ)_$(β)_$(min_deg).dat"
@@ -201,30 +205,62 @@ end
         #read graph (if exist):
         G = ig.Graph.Read_Edgelist(g_name, directed = false)
         G.delete_vertices(0)
+        g = nx.read_edgelist(g_name)
+        nodeslist = collect(nx.nodes(g));
+        
         partition = [parse.(Int,e2) - 1 for (e1,e2) in split.(readlines(g_cl_name))]
-        
-        #find partitions:
         no_partitions = length(unique(partition))
-        louvain_partition = G.community_multilevel()
-        louvain_length = length(unique(louvain_partition.membership))
-        leiden_partition = la.find_partition(G, la.ModularityVertexPartition, seed = seed)
-        leiden_length = length(unique(leiden_partition.membership))
-        ami_gt_louvain = mutualinfo(partition,louvain_partition.membership)
-        ami_gt_leiden = mutualinfo(partition,leiden_partition.membership)
-        ami_leiden_louvain = mutualinfo(leiden_partition.membership,louvain_partition.membership)
-        #find modularity:
         ground_truth_modularity = G.modularity(partition)
-        louvain_modularity = G.modularity(louvain_partition.membership)
-        leiden_modularity = G.modularity(leiden_partition.membership)
         
-        #save to the file:
-        stats_name = res_dir * "g_stats_$(n)_$(ξ)_$(γ)_$(β)_$(min_deg).dat"
-        open(stats_name, "w") do io
-            println(io, join([n,ξ,γ,β,min_deg,no_partitions,louvain_length,
-                        leiden_length,ground_truth_modularity,louvain_modularity, leiden_modularity,ami_gt_louvain,
-                        ami_gt_leiden, ami_leiden_louvain],";"))
+        measures = Dict("louvain_modularity" => [],
+                "louvain_ami" => [],
+                "leiden_modularity" => [],
+                "leiden_ami" => [],
+                "ecg_modularity" => [],
+                "ecg_ami" => [],)
+        #louvain_lengths = []
+        #leiden_lengths = []
+        #ecg_lengths = []
+        #find partitions:
+        for i = 1:no_iters
+            #louvain stats:
+            louvain_partition = community_louvain.best_partition(g, random_state = i)
+            #louvain_length = length(unique(values(louvain_partition)))
+            #push!(louvain_lengths, louvain_length)
+            louvain_modularity = community_louvain.modularity(louvain_partition,g)   
+            push!(measures["louvain_modularity"], louvain_modularity)
+            louvain_partition = [louvain_partition["$j"] for j = 1:length(louvain_partition)]
+            ami_gt_louvain = mutualinfo(partition,louvain_partition)
+            push!(measures["louvain_ami"], ami_gt_louvain)
+            
+            #leiden stats:
+            leiden_partition = la.find_partition(G, la.ModularityVertexPartition, seed = i)
+            #leiden_length = length(unique(leiden_partition.membership))
+            #push!(leiden_lengths, leiden_length)
+            leiden_modularity = G.modularity(leiden_partition.membership)
+            push!(measures["leiden_modularity"], leiden_modularity)
+            ami_gt_leiden = mutualinfo(partition,leiden_partition.membership)
+            push!(measures["leiden_ami"], ami_gt_leiden)
+            
+            #ECG stats:
+            ecg_partition = G.community_ecg(ens_size=32)
+            #ecg_length = length(unique(ecg_partition.membership))
+            #push!(ecg_lengths, ecg_length)
+            ecg_modularity = G.modularity(ecg_partition.membership)
+            push!(measures["ecg_modularity"], ecg_modularity)
+            ami_gt_ecg = mutualinfo(partition,ecg_partition.membership)
+            push!(measures["ecg_ami"], ami_gt_ecg)
         end
-        
+           
+        #save to the files:
+        for algo in ["louvain", "leiden", "ecg"]
+            for measure in ["modularity", "ami"]
+                stats_name = res_dir * "g_stats_$(algo)_$(measure)_$(n)_$(ξ)_$(γ)_$(β)_$(min_deg).dat"
+                open(stats_name, "w") do io
+                    println(io, join(measures["$(algo)_$(measure)"],";"))
+                end      
+            end
+        end    
     catch err
         logger = SimpleLogger(open(logname, "w+"))
         with_logger(logger) do
